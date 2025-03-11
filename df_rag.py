@@ -1,577 +1,333 @@
-#!/usr/bin/env python3
-"""
-DF_RAG - A tool for interacting with CSV and Excel data using natural language through an LLM
-"""
-
-import os
-import json
-import requests
 import pandas as pd
-import numpy as np
-from typing import Dict, Any, Optional, List, Tuple, Union
-from dotenv import load_dotenv
-from fuzzywuzzy import process, fuzz
+import os
+from typing import List, Dict, Union, Optional
+from rapidfuzz import fuzz, process
+import argparse
+import logging
+from pathlib import Path
+import warnings
+import json
+from dataclasses import dataclass
+import requests
 
-# Load environment variables
-load_dotenv()
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
+@dataclass
+class DataSource:
+    """Represents a loaded data source with its metadata"""
+    filename: str
+    data: pd.DataFrame
+    description: str = ""
 
-class LLMBackend:
-    """Base class for LLM backends"""
+class DataManager:
+    """Manages loading and accessing data from CSV and Excel files"""
     
-    def generate(self, prompt: str, system_prompt: Optional[str] = None, **kwargs) -> str:
-        """Generate a response from the LLM"""
-        raise NotImplementedError("Subclasses must implement this method")
-
-
-class OllamaBackend(LLMBackend):
-    """Ollama backend for LLM interactions"""
-    
-    def __init__(self, model: Optional[str] = None, base_url: Optional[str] = None):
-        """
-        Initialize the Ollama backend
+    def __init__(self):
+        self.data_sources: Dict[str, DataSource] = {}
         
-        Args:
-            model: The model to use (defaults to env var OLLAMA_MODEL or 'llama3')
-            base_url: The base URL for the Ollama API (defaults to env var OLLAMA_BASE_URL or 'http://localhost:11434')
-        """
-        self.model = model or os.getenv("OLLAMA_MODEL", "llama3")
-        self.base_url = base_url or os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
-        self.api_url = f"{self.base_url}/api/generate"
-    
-    def generate(self, prompt: str, system_prompt: Optional[str] = None, **kwargs) -> str:
-        """
-        Generate a response from the Ollama LLM
-        
-        Args:
-            prompt: The user prompt
-            system_prompt: Optional system prompt to guide the model
-            **kwargs: Additional parameters to pass to the Ollama API
-            
-        Returns:
-            The generated text response
-        """
-        payload = {
-            "model": self.model,
-            "prompt": prompt,
-            "stream": False,
-            **kwargs
-        }
-        
-        if system_prompt:
-            payload["system"] = system_prompt
-            
+    def load_file(self, file_path: str) -> bool:
+        """Load a single file into memory"""
         try:
-            response = requests.post(self.api_url, json=payload)
-            response.raise_for_status()
-            return response.json().get("response", "")
-        except requests.RequestException as e:
-            error_msg = f"Error communicating with Ollama: {str(e)}"
-            print(error_msg)
-            return error_msg
-
-
-class LLMFactory:
-    """Factory for creating LLM backends"""
-    
-    @staticmethod
-    def create(backend_type: str = "ollama", **kwargs) -> LLMBackend:
-        """
-        Create an LLM backend
-        
-        Args:
-            backend_type: The type of backend to create ('ollama' is currently the only supported type)
-            **kwargs: Additional parameters to pass to the backend constructor
-            
-        Returns:
-            An LLM backend instance
-        """
-        if backend_type.lower() == "ollama":
-            return OllamaBackend(**kwargs)
-        else:
-            raise ValueError(f"Unsupported LLM backend type: {backend_type}")
-
-
-class DataHandler:
-    """Handler for loading and processing data from CSV and Excel files"""
-    
-    def __init__(self, path: Optional[str] = None):
-        """
-        Initialize the data handler
-        
-        Args:
-            path: Optional path to a data file or directory to load
-        """
-        self.dataframes = {}  # Dictionary to store multiple dataframes
-        self.metadata = {}    # Dictionary to store metadata for each file
-        
-        if path:
-            self.load_path(path)
-    
-    def load_path(self, path: str) -> bool:
-        """
-        Load data from a file or directory
-        
-        Args:
-            path: Path to the data file or directory
-            
-        Returns:
-            True if loading was successful, False otherwise
-        """
-        if not os.path.exists(path):
-            print(f"Path not found: {path}")
-            return False
-        
-        if os.path.isdir(path):
-            return self._load_directory(path)
-        else:
-            return self._load_file(path)
-    
-    def _load_directory(self, dir_path: str) -> bool:
-        """Load all supported files from a directory"""
-        success = False
-        for file in os.listdir(dir_path):
-            if file.lower().endswith(('.csv', '.xlsx', '.xls')):
-                file_path = os.path.join(dir_path, file)
-                if self._load_file(file_path):
-                    success = True
-        return success
-    
-    def _load_file(self, file_path: str) -> bool:
-        """Load a single data file"""
-        file_ext = os.path.splitext(file_path)[1].lower()
-        file_name = os.path.basename(file_path)
-        
-        try:
-            if file_ext == '.csv':
-                df = pd.read_csv(file_path)
-                file_type = 'csv'
-            elif file_ext in ['.xlsx', '.xls']:
-                df = pd.read_excel(file_path)
-                file_type = 'excel'
-            else:
-                print(f"Unsupported file type: {file_ext}")
+            file_path = Path(file_path)
+            if not file_path.exists():
+                logger.error(f"File not found: {file_path}")
                 return False
-            
-            self.dataframes[file_name] = df
-            self._generate_metadata(file_name, file_path, file_type)
-            return True
-        except Exception as e:
-            print(f"Error loading {file_path}: {str(e)}")
-            return False
-    
-    def _generate_metadata(self, file_name: str, file_path: str, file_type: str) -> None:
-        """Generate metadata about a loaded dataframe"""
-        df = self.dataframes.get(file_name)
-        if df is None:
-            return
-        
-        # Basic metadata
-        self.metadata[file_name] = {
-            'file_path': file_path,
-            'file_type': file_type,
-            'rows': len(df),
-            'columns': list(df.columns),
-            'dtypes': {col: str(dtype) for col, dtype in df.dtypes.items()},
-            'missing_values': df.isna().sum().to_dict(),
-            'numeric_columns': list(df.select_dtypes(include=[np.number]).columns),
-            'categorical_columns': list(df.select_dtypes(include=['object', 'category']).columns),
-            'datetime_columns': list(df.select_dtypes(include=['datetime']).columns),
-        }
-        
-        # Add summary statistics for numeric columns (using sampling for large datasets)
-        self.metadata[file_name]['numeric_stats'] = {}
-        sample_size = min(len(df), 10000)  # Limit sample size for large datasets
-        df_sample = df.sample(n=sample_size) if len(df) > sample_size else df
-        
-        for col in self.metadata[file_name]['numeric_columns']:
-            self.metadata[file_name]['numeric_stats'][col] = {
-                'min': float(df[col].min()) if not pd.isna(df[col].min()) else None,
-                'max': float(df[col].max()) if not pd.isna(df[col].max()) else None,
-                'mean': float(df_sample[col].mean()) if not pd.isna(df_sample[col].mean()) else None,
-                'median': float(df_sample[col].median()) if not pd.isna(df_sample[col].median()) else None,
-                'std': float(df_sample[col].std()) if not pd.isna(df_sample[col].std()) else None,
-            }
-        
-        # Add value counts for categorical columns (limited to top 10, using sampling)
-        self.metadata[file_name]['categorical_stats'] = {}
-        for col in self.metadata[file_name]['categorical_columns']:
-            value_counts = df_sample[col].value_counts().head(10).to_dict()
-            self.metadata[file_name]['categorical_stats'][col] = {str(k): int(v) for k, v in value_counts.items()}
-    
-    def get_dataframe_info(self, file_name: Optional[str] = None) -> str:
-        """
-        Get a string representation of the dataframe info
-        
-        Args:
-            file_name: Optional specific file to get info for
-            
-        Returns:
-            A string with information about the dataframe(s)
-        """
-        if not self.dataframes:
-            return "No data loaded"
-        
-        info = []
-        files_to_process = [file_name] if file_name else self.dataframes.keys()
-        
-        for fname in files_to_process:
-            if fname not in self.dataframes:
-                continue
                 
-            df = self.dataframes[fname]
-            metadata = self.metadata[fname]
-            
-            info.append(f"\nFile: {metadata['file_path']} ({metadata['file_type']})")
-            info.append(f"Shape: {df.shape[0]} rows × {df.shape[1]} columns")
-            info.append("Columns:")
-            
-            for col in df.columns:
-                dtype = df[col].dtype
-                missing = df[col].isna().sum()
-                missing_pct = (missing / len(df)) * 100
-                info.append(f"  - {col} ({dtype}): {missing} missing values ({missing_pct:.1f}%)")
-        
-        return "\n".join(info)
-    
-    def find_columns(self, query: str, file_name: Optional[str] = None, threshold: int = 70) -> Dict[str, List[str]]:
-        """
-        Find columns that match the query using fuzzy matching
-        
-        Args:
-            query: The search query
-            file_name: Optional specific file to search in
-            threshold: The minimum similarity score (0-100)
-            
-        Returns:
-            A dictionary mapping file names to lists of matching column names
-        """
-        results = {}
-        files_to_process = [file_name] if file_name else self.dataframes.keys()
-        
-        for fname in files_to_process:
-            if fname not in self.dataframes:
-                continue
-                
-            df = self.dataframes[fname]
-            if not df.columns.any():
-                continue
-            
-            matches = process.extractBests(
-                query, 
-                df.columns, 
-                scorer=fuzz.token_sort_ratio, 
-                score_cutoff=threshold
-            )
-            
-            if matches:
-                results[fname] = [match[0] for match in matches]
-        
-        return results
-
-    def get_context_for_llm(self, max_rows: int = 100, file_name: Optional[str] = None) -> Dict[str, Any]:
-        """
-        Get context information about the dataframe(s) for the LLM
-        
-        Args:
-            max_rows: Maximum number of rows to include in the sample per file
-            file_name: Optional specific file to get context for
-            
-        Returns:
-            A dictionary with context information
-        """
-        if not self.dataframes:
-            return {"error": "No data loaded"}
-        
-        context = {"files": {}}
-        files_to_process = [file_name] if file_name else self.dataframes.keys()
-        
-        for fname in files_to_process:
-            if fname not in self.dataframes:
-                continue
-                
-            df = self.dataframes[fname]
-            metadata = self.metadata[fname]
-            
-            # Use smart sampling based on data size
-            sample_size = min(max_rows, len(df))
-            if len(df) > max_rows * 10:  # For very large datasets
-                # Take samples from start, middle, and end
-                start_sample = df.head(sample_size // 3)
-                middle_start = len(df) // 2 - (sample_size // 3) // 2
-                middle_sample = df.iloc[middle_start:middle_start + sample_size // 3]
-                end_sample = df.tail(sample_size // 3)
-                sample_df = pd.concat([start_sample, middle_sample, end_sample])
+            if file_path.suffix.lower() == '.csv':
+                df = pd.read_csv(file_path)
+            elif file_path.suffix.lower() in ['.xlsx', '.xls']:
+                df = pd.read_excel(file_path)
             else:
-                sample_df = df.sample(n=sample_size)
+                logger.error(f"Unsupported file type: {file_path.suffix}")
+                return False
+                
+            self.data_sources[file_path.name] = DataSource(
+                filename=file_path.name,
+                data=df,
+                description=f"Data from {file_path.name} with {len(df)} rows and {len(df.columns)} columns"
+            )
+            logger.info(f"Successfully loaded {file_path.name}")
+            return True
             
-            context["files"][fname] = {
-                "file_info": {
-                    "path": metadata['file_path'],
-                    "type": metadata['file_type'],
-                },
-                "dataframe_info": {
-                    "shape": df.shape,
-                    "columns": list(df.columns),
-                    "dtypes": metadata['dtypes'],
-                },
-                "sample_data": sample_df.to_dict(orient='records'),
-                "summary_stats": {
-                    "numeric": metadata.get('numeric_stats', {}),
-                    "categorical": metadata.get('categorical_stats', {})
-                }
-            }
+        except Exception as e:
+            logger.error(f"Error loading file {file_path}: {str(e)}")
+            return False
+            
+    def load_directory(self, directory_path: str) -> int:
+        """Load all supported files from a directory"""
+        directory = Path(directory_path)
+        if not directory.exists() or not directory.is_dir():
+            logger.error(f"Invalid directory: {directory_path}")
+            return 0
+            
+        loaded_files = 0
+        for file_path in directory.glob("*"):
+            if file_path.suffix.lower() in ['.csv', '.xlsx', '.xls']:
+                if self.load_file(str(file_path)):
+                    loaded_files += 1
+                    
+        return loaded_files
+
+class QueryProcessor:
+    """Processes natural language queries and retrieves relevant data"""
+    
+    def __init__(self, data_manager: DataManager):
+        self.data_manager = data_manager
+        self.conversation_history: List[Dict[str, str]] = []  # Store full conversation
+        self.SIMILARITY_THRESHOLD = 80  # Minimum fuzzy match score (0-100)
+        self.MAX_HISTORY = 5  # Maximum number of previous exchanges to include
         
+    def _fuzzy_search_columns(self, query: str, df: pd.DataFrame) -> List[str]:
+        """Find columns that match the query using fuzzy matching"""
+        try:
+            matches = process.extract(
+                query,
+                df.columns.tolist(),  # Convert to list explicitly
+                scorer=fuzz.partial_ratio,
+                limit=None
+            )
+
+            # matches will be a list of tuples: (choice, score, index)
+            return [col for col, score, *_ in matches if score >= self.SIMILARITY_THRESHOLD]
+        except Exception as e:
+            logger.error(f"Error in fuzzy column search: {str(e)}")
+            return []
+        
+    def _fuzzy_search_values(self, query: str, df: pd.DataFrame) -> pd.DataFrame:
+        """Search for matching values in the dataframe"""
+        mask = pd.DataFrame(False, index=df.index, columns=df.columns)
+        
+        for col in df.columns:
+            if df[col].dtype == object:  # Only search string columns
+                mask[col] = df[col].astype(str).apply(
+                    lambda x: fuzz.WRatio(query.lower(), str(x).lower()) >= self.SIMILARITY_THRESHOLD
+                )
+                
+        return df[mask.any(axis=1)]
+        
+    def _prepare_context(self, relevant_data: pd.DataFrame, max_rows: int = 50) -> str:
+        """Prepare data context for the LLM"""
+        if len(relevant_data) > max_rows:
+            return f"Data sample ({max_rows} of {len(relevant_data)} rows):\n{relevant_data.head(max_rows).to_string()}"
+        return f"Data ({len(relevant_data)} rows):\n{relevant_data.to_string()}"
+        
+    def _get_conversation_context(self) -> str:
+        """Create a formatted string of recent conversation history"""
+        if not self.conversation_history:
+            return ""
+            
+        context = "\nPrevious conversation:\n"
+        # Get last MAX_HISTORY exchanges
+        recent_history = self.conversation_history[-self.MAX_HISTORY:]
+        for exchange in recent_history:
+            context += f"User: {exchange['query']}\n"
+            if 'response' in exchange:
+                context += f"Assistant: {exchange['response']}\n"
         return context
-
-
-class DFRAG:
-    """
-    A tool for interacting with CSV and Excel data using natural language through an LLM
-    """
-    
-    def __init__(
-        self, 
-        path: Optional[str] = None,
-        llm_backend: str = "ollama",
-        llm_model: Optional[str] = None,
-        max_context_rows: int = 100
-    ):
-        """
-        Initialize the DFRAG tool
         
-        Args:
-            path: Optional path to a data file or directory to load
-            llm_backend: The LLM backend to use (currently only 'ollama' is supported)
-            llm_model: The model to use with the LLM backend
-            max_context_rows: Maximum number of rows to include in the context per file
-        """
-        self.data_handler = DataHandler(path)
-        self.llm = LLMFactory.create(llm_backend, model=llm_model)
-        self.max_context_rows = max_context_rows
-        self.conversation_history = []
-        self.current_context = None  # Store the last used context
-    
-    def load_path(self, path: str) -> bool:
-        """
-        Load data from a file or directory
-        
-        Args:
-            path: Path to the data file or directory
+    def _call_llama(self, prompt: str) -> str:
+        """Make an API call to Ollama running Llama3.1"""
+        try:
+            # Add conversation history to the prompt
+            context = self._get_conversation_context()
             
-        Returns:
-            True if loading was successful, False otherwise
-        """
-        return self.data_handler.load_path(path)
-    
-    def _build_system_prompt(self) -> str:
-        """
-        Build the system prompt for the LLM
-        
-        Returns:
-            The system prompt string
-        """
-        if not self.data_handler.dataframes:
-            return "You are an AI assistant that helps users analyze data. No data is currently loaded."
-        
-        df_info = self.data_handler.get_dataframe_info()
-        
-        system_prompt = f"""You are an AI assistant that helps users analyze data from multiple files.
-        
-The available data has the following structure:
-{df_info}
-
-Your task is to:
-1. Understand the user's question about the data
-2. Provide accurate and helpful answers based on the data provided
-3. When appropriate, suggest additional insights or visualizations that might be helpful
-4. If you're unsure about something or need more information, ask clarifying questions
-5. When multiple files are available, specify which file(s) you're using for the analysis
-
-Important guidelines:
-- Base your answers ONLY on the data provided, not on external knowledge
-- If the user asks for something that cannot be determined from the data, explain why
-- Be precise and accurate in your descriptions of the data
-- When referring to columns, use the exact column names from the data and specify which file they're from
-- If the user's question is ambiguous, ask for clarification
-- Format numerical results appropriately (e.g., use appropriate decimal places, units)
-- When describing trends or patterns, provide specific examples from the data
+            # Add citation instructions
+            citation_instructions = """
+When responding, please cite your sources using [filename:column/row] format.
+For example: 
+- When referring to data from a specific column: [sales.csv:column=revenue]
+- When referring to specific rows: [employees.csv:rows=10-15]
+- When using column statistics: [products.csv:stats=category]
+Include these citations inline with your response.
 """
-        
-        return system_prompt
-    
-    def _analyze_query(self, query: str) -> Dict[str, Any]:
-        """
-        Analyze the query to determine relevant files and columns
-        
-        Args:
-            query: The user's query
+            full_prompt = f"{context}\n{citation_instructions}\nCurrent query: {prompt}"
             
-        Returns:
-            Dictionary with analysis results
-        """
-        # First, get all column names across all files
-        all_columns = set()
-        for df in self.data_handler.dataframes.values():
-            all_columns.update(df.columns)
-        
-        # Find potential column references in the query
-        relevant_columns = []
-        for col in all_columns:
-            if col.lower() in query.lower():
-                relevant_columns.append(col)
-        
-        # Find potential file references
-        relevant_files = []
-        for fname in self.data_handler.dataframes.keys():
-            if fname.lower() in query.lower():
-                relevant_files.append(fname)
-        
-        return {
-            "relevant_columns": relevant_columns,
-            "relevant_files": relevant_files,
-            "all_files": list(self.data_handler.dataframes.keys())
-        }
-    
-    def _build_user_prompt(self, query: str) -> str:
-        """
-        Build the user prompt for the LLM, including relevant data context
-        
-        Args:
-            query: The user's query
+            response = requests.post(
+                'http://localhost:11434/api/generate',
+                json={
+                    'model': 'llama3.1',
+                    'prompt': full_prompt,
+                    'stream': False
+                }
+            )
+            response.raise_for_status()
+            return response.json()['response']
+        except Exception as e:
+            logger.error(f"Error calling Llama: {str(e)}")
+            return "I apologize, but I encountered an error processing your request."
             
-        Returns:
-            The complete user prompt string
-        """
-        # Analyze the query to determine relevant context
-        analysis = self._analyze_query(query)
-        
-        # If specific files are mentioned, use only those
-        target_files = analysis["relevant_files"] if analysis["relevant_files"] else None
-        
-        # Get context with smart sampling
-        context = self.data_handler.get_context_for_llm(
-            self.max_context_rows,
-            file_name=target_files[0] if len(target_files) == 1 else None
-        )
-        
-        # Store the current context for potential follow-up queries
-        self.current_context = context
-        
-        # Convert context to a formatted string
-        context_str = json.dumps(context, indent=2)
-        
-        user_prompt = f"""
-User Query: {query}
-
-Data Context:
-{context_str}
-
-Query Analysis:
-- Relevant columns detected: {', '.join(analysis['relevant_columns']) if analysis['relevant_columns'] else 'None'}
-- Files mentioned in query: {', '.join(analysis['relevant_files']) if analysis['relevant_files'] else 'None'}
-- Available files: {', '.join(analysis['all_files'])}
-
-Please analyze the data and answer the query based on the provided context.
-If you need information from files not included in the current context, please indicate this in your response.
-"""
-        
-        return user_prompt
-    
-    def query(self, query: str) -> str:
-        """
-        Query the data using natural language
-        
-        Args:
-            query: The user's natural language query
+    def _get_column_stats(self, df: pd.DataFrame, column: str) -> str:
+        """Get high-level statistics for a column"""
+        try:
+            stats = []
+            # Get basic info
+            unique_count = df[column].nunique()
+            total_count = len(df[column])
+            null_count = df[column].isnull().sum()
             
-        Returns:
-            The LLM's response
-        """
-        if not self.data_handler.dataframes:
-            return "No data is currently loaded. Please load a CSV or Excel file first."
+            stats.append(f"Total values: {total_count}")
+            stats.append(f"Unique values: {unique_count}")
+            
+            if null_count > 0:
+                stats.append(f"Null values: {null_count}")
+            
+            # For numeric columns
+            if pd.api.types.is_numeric_dtype(df[column]):
+                stats.append(f"Range: {df[column].min()} to {df[column].max()}")
+            # For categorical/text columns
+            elif pd.api.types.is_string_dtype(df[column]):
+                top_values = df[column].value_counts().head(3)
+                stats.append("Top 3 values:")
+                for val, count in top_values.items():
+                    stats.append(f"  - {val}: {count}")
+                    
+            return f"Column '{column}' stats:\n" + "\n".join(stats)
+        except Exception as e:
+            logger.error(f"Error getting column stats: {str(e)}")
+            return ""
+
+    def process_query(self, query: str) -> str:
+        """Process a natural language query and return a response"""
+        if not self.data_manager.data_sources:
+            return "No data sources have been loaded. Please load some CSV or Excel files first."
+            
+        # Add query to conversation history
+        current_exchange = {"query": query}
         
-        system_prompt = self._build_system_prompt()
-        user_prompt = self._build_user_prompt(query)
+        # Handle general queries about the loaded data
+        if any(keyword in query.lower() for keyword in ['summarize', 'describe', 'what data', 'show me']):
+            summaries = []
+            for source in self.data_manager.data_sources.values():
+                summary = f"\n[{source.filename}:summary]\n"
+                summary += f"- {len(source.data)} rows, {len(source.data.columns)} columns\n"
+                summary += f"- Columns: {', '.join(source.data.columns)}\n"
+                summaries.append(summary)
+            response = "Here's a summary of the loaded data:" + ''.join(summaries)
+            current_exchange['response'] = response
+            self.conversation_history.append(current_exchange)
+            return response
+            
+        # Search for relevant data across all sources
+        relevant_results = []
+        column_stats = []  # Store column statistics
         
-        # Add to conversation history
-        self.conversation_history.append({"role": "user", "content": query})
+        for source in self.data_manager.data_sources.values():
+            # Search in column names
+            matching_cols = self._fuzzy_search_columns(query, source.data)
+            if matching_cols:
+                relevant_subset = source.data[matching_cols]
+                relevant_results.append({
+                    'source': source.filename,
+                    'data': relevant_subset,
+                    'columns': matching_cols,
+                    'context': f"Matching columns from {source.filename}"
+                })
+                # Add column statistics for matching columns
+                for col in matching_cols:
+                    stats = self._get_column_stats(source.data, col)
+                    if stats:
+                        column_stats.append(f"\n[{source.filename}:stats={col}]\n{stats}")
+                
+            # Search in values
+            matching_rows = self._fuzzy_search_values(query, source.data)
+            if not matching_rows.empty:
+                row_indices = matching_rows.index.tolist()
+                row_range = f"{min(row_indices)}-{max(row_indices)}"
+                relevant_results.append({
+                    'source': source.filename,
+                    'data': matching_rows,
+                    'row_range': row_range,
+                    'context': f"Matching rows {row_range} from {source.filename}"
+                })
+                
+        # Prepare prompt for Llama
+        prompt = f"""Based on the following data and conversation history, please answer this query: "{query}"\n\n"""
         
-        # Generate response from LLM
-        response = self.llm.generate(user_prompt, system_prompt=system_prompt)
+        # Add column statistics to the prompt if available
+        if column_stats:
+            prompt += "\nColumn Analysis:\n" + "\n".join(column_stats) + "\n"
         
-        # Add to conversation history
-        self.conversation_history.append({"role": "assistant", "content": response})
-        
+        for result in relevant_results:
+            context = self._prepare_context(result['data'])
+            citation = f"[{result['source']}:"
+            if 'columns' in result:
+                citation += f"columns={','.join(result['columns'])}"
+            if 'row_range' in result:
+                citation += f"rows={result['row_range']}"
+            citation += "]"
+            prompt += f"\n{citation}\n{context}\n"
+            
+        # Call Llama and get response
+        response = self._call_llama(prompt)
+        current_exchange['response'] = response
+        self.conversation_history.append(current_exchange)
         return response
-    
-    def get_dataframes(self) -> Dict[str, Any]:
-        """
-        Get all current dataframes
-        
-        Returns:
-            Dictionary mapping file names to DataFrame objects
-        """
-        return self.data_handler.dataframes
-    
-    def get_dataframe_info(self, file_name: Optional[str] = None) -> str:
-        """
-        Get information about the current dataframe(s)
-        
-        Args:
-            file_name: Optional specific file to get info for
-            
-        Returns:
-            A string with information about the dataframe(s)
-        """
-        return self.data_handler.get_dataframe_info(file_name)
-    
-    def filter_data(self, filter_query: Dict[str, Any]) -> None:
-        """
-        Filter the dataframe based on a query dictionary
-        
-        Args:
-            filter_query: A dictionary with column names as keys and filter values
-        """
-        if not self.data_handler.dataframes:
-            return
-        
-        for fname, df in self.data_handler.dataframes.items():
-            self.data_handler.dataframes[fname] = self.data_handler.filter_dataframe(filter_query)
-            self.data_handler._generate_metadata(fname, self.data_handler.metadata[fname]['file_path'], self.data_handler.metadata[fname]['file_type'])
-    
-    def reset_filters(self) -> None:
-        """Reset any filters applied to the dataframe"""
-        if self.data_handler.dataframes:
-            for fname in self.data_handler.dataframes.keys():
-                self.data_handler.load_path(self.data_handler.metadata[fname]['file_path'])
-    
-    def clear_conversation(self) -> None:
-        """Clear the conversation history"""
-        self.conversation_history = []
-        self.current_context = None
 
-
-# Simple usage example
-if __name__ == "__main__":
-    import sys
+class ChatBot:
+    """Main chatbot class that handles user interaction"""
     
-    if len(sys.argv) > 1:
-        path = sys.argv[1]
-        rag = DFRAG(path)
+    def __init__(self):
+        self.data_manager = DataManager()
+        self.query_processor = QueryProcessor(self.data_manager)
         
-        print(f"Loaded data from {path}")
-        print(rag.get_dataframe_info())
+    def load_data(self, path: str) -> None:
+        """Load data from a file or directory"""
+        path = Path(path)
+        if path.is_dir():
+            loaded = self.data_manager.load_directory(str(path))
+            print(f"Loaded {loaded} files from directory")
+        else:
+            if self.data_manager.load_file(str(path)):
+                print(f"Successfully loaded {path.name}")
+            else:
+                print(f"Failed to load {path.name}")
+                
+    def run(self):
+        """Run the interactive chat session"""
+        print("Welcome to the CSV & Excel Query Chatbot!")
+        print("Type 'exit' to quit, 'load <path>' to load data, or enter your query.")
         
         while True:
-            query = input("\nAsk a question (or 'exit' to quit): ")
-            if query.lower() == 'exit':
+            try:
+                user_input = input("\nYou: ").strip()
+                
+                if user_input.lower() == 'exit':
+                    print("Goodbye!")
+                    break
+                    
+                if user_input.lower().startswith('load '):
+                    path = user_input[5:].strip()
+                    self.load_data(path)
+                    continue
+                    
+                if not user_input:
+                    continue
+                    
+                response = self.query_processor.process_query(user_input)
+                print("\nChatbot:", response)
+                
+            except KeyboardInterrupt:
+                print("\nGoodbye!")
                 break
-            
-            print("\nThinking...")
-            response = rag.query(query)
-            print(f"\nResponse: {response}")
-    else:
-        print("Usage: python df_rag.py <path_to_file_or_directory>")
-        print("Example: python df_rag.py data.csv")
-        print("Example: python df_rag.py ./data_directory") 
+            except Exception as e:
+                logger.error(f"Error: {str(e)}")
+                print("An error occurred. Please try again.")
+
+def main():
+    parser = argparse.ArgumentParser(description="CSV & Excel Query Chatbot")
+    parser.add_argument('--path', type=str, help='Initial file or directory to load')
+    args = parser.parse_args()
+    
+    chatbot = ChatBot()
+    if args.path:
+        chatbot.load_data(args.path)
+        
+    chatbot.run()
+
+if __name__ == "__main__":
+    main()
